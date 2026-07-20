@@ -387,9 +387,9 @@ def split_worst_cluster_with_rf_and_kmeans(sdf, worst, prob_cols, logger=None):
 
 @configure(profile=["DRIVER_MEMORY_EXTRA_EXTRA_LARGE", "EXECUTOR_MEMORY_LARGE"])
 @transform(
-    df_trained_out=Output("/path/to/df_trained_out"),
-    R_df_out=Output("/path/to/R_df_out"),
-    P_df_out=Output("/path/to/P_df_out"),
+    df_trained=Output("/path/to/df_trained"),
+    R_df=Output("/path/to/R_df"),
+    P_df=Output("/path/to/P_df"),
     features=Input("/path/to/features"),
     end_states=Input("/path/to/end_states"),
 )
