@@ -2104,7 +2104,7 @@ def cluster_accuracy(k1, delta, samples):
         for t in range(T):
             s = clust[i, t]
             s1 = samples[i, t][3]
-            acc[s, s1] += 1 =
+            acc[s, s1] += 1
     for s in range(k):
         acc[s] = acc[s] / max(1, sum(acc[s]))
     return acc
