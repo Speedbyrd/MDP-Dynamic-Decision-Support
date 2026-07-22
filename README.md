@@ -71,7 +71,7 @@ Q_E_df
 ```python
 [...actions...]
 ```
-represents the action-value function of the MDP. The value at row r and column c represents the value of action c when at cluster r. 
+represents the action-value function (long-term risk) of the MDP. The value at row r and column c represents the value of action c when at cluster r. 
 
 # analyze_mrl_results.ipynb
 
@@ -79,3 +79,6 @@ This is the python notebook used to generate figures to visualize results and ev
 
 The cluster heatmap section generates a heatmap describing the average value of each feature in each clinical state relative to the overall average value in the dataset, like in figure 3 of the paper. 
 
+The action values and frequencies section visualizes the frequency of each action and the long-term risk of each action, for each cluster (state). An example of this can be seen in figure 4 of the paper.
+
+The absorbing probabilities section can be used to show the probability of reaching each end state when starting from a given cluster and taking a given action, and then following the optimal policy thereafter. An example of this can be seen in figure 4 of the paper, where we showed the probability of reaching each end state for state 5, action 3.
