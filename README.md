@@ -1,7 +1,7 @@
-# sepsis-fluids
+# MDP Dynamic Decision Support
 
 
-# train.py
+# CLUSTERING
 
 Assigns clusters (clinical states) to the patient-hours.
 
@@ -45,9 +45,9 @@ P_df
 ```
 where prob is the probability of transitioning to NEXT_CLUSTER when taking action ACTION in CLUSTER. 
 
-# solveMDP.py
+# SOLVING the MDP
 
-solveMDP.py takes in the outputs from train.py and solves for the optimal policy. 
+Takes in the outputs from clustering and solves for the optimal policy. 
 
 
 INPUTS
