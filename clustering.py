@@ -71,10 +71,7 @@ from .testing import (
     next_clusters,
     stochastic_training_value_error,
     get_MDP_stochastic,
-    training_reward_error,
-    testing_reward_error,
 )
-from .MDPToolsRobust import SolveMDP_Robust, SolveMDP, SolveMDP_Robust_expected
 
 #################################################################
 
@@ -669,7 +666,6 @@ def splitter(
         split_scores,
     )
 
-
 # splitter() is the wrap-up function. Takes the below parameters and
 # performs the algorithm until all contradictions are
 # resolved or until the max number of iterations is reached
@@ -694,11 +690,11 @@ def splitter_stochastic(
     classification="RandomForestClassifier",  # string: classification alg
     split_classifier_params={
         "random_state": 0
-    },  # dict: classification params # not used
-    h=-1,  # not used
-    gamma=1,  # not used
-    verbose=False,  # not used
-    n_param=-1,  # not used
+    },  # dict: classification params #not used
+    h=-1,  # idk what this is, not used
+    gamma=1,  # idk what this is, not used
+    verbose=False,  # idk what this is, not used
+    n_param=-1,  # idk what this is, not used
     plot=False,
     min_obs=2000,
     incoherence_metric="std",
@@ -707,6 +703,14 @@ def splitter_stochastic(
     print("incoherence metric: ", incoherence_metric)
     print("min # points for cluster to be split: ", min_obs)
     df = train_df.copy()
+
+    # print("initial clusters: ", df["CLUSTER"].unique())
+    # print("initial next clusters: ", df["NEXT_CLUSTER"].unique())
+
+    # we're gonna use the same method as the deterministic algorithm in deciding which cluster to split
+    # end_state_df = end_state_df.replace('readmitted',2222) #make this more general
+    # end_state_df = end_state_df.replace('discharged',1111)
+    # end_state_df = end_state_df.replace('dead',4444)
 
     end_state_df = end_state_df[["ID", "end_state", "Reward"]].set_index(
         "ID"
@@ -876,13 +880,6 @@ def splitter_stochastic(
             grouped.loc[ind, "DET_INCOHERENCE"] = det_incoherence
             grouped.loc[ind, "INFO_RADIUS"] = info_radius
 
-        # print(grouped)
-        # print(grouped.query('Count >= @min_obs').sort_values('Sum_std', ascending=False).iloc[0])
-        # print(grouped.query('Count >= @min_obs').sort_values('DET_INCOHERENCE', ascending=False).iloc[0])
-        # print(grouped.query('Count >= @min_obs').sort_values('INFO_RADIUS', ascending=False).iloc[0])
-
-        ## counting the number of observations in each cluster-action group
-        # grouped['Count'] = df.groupby(['CLUSTER', 'ACTION'])['TIME'].count().reset_index()['TIME']
         try:
             ## finds the cluster-action group (that has enough observations) with the highest summed std (most incoherent) in order to split it into 2 clusters
             # print(grouped.query('Count >= @min_obs').sort_values('Sum_std', ascending=False))
@@ -1332,203 +1329,6 @@ def splitter_stochastic(
         # the output dataframe has updated CLUSTER and NEXT_CLUSTER columns as well as predicted probabilities of ending up in each of the clusters next
         return df, best_df, df_train_error, df_incoherences, opt_k
 
-
-    def solve_MDP_Robust_expected(
-        self,
-        alpha=0.2,  # statistical alpha threshold
-        beta=0.6,  # statistical beta threshold
-        min_action_obs=-1,  # int: least number of actions that must be seen
-        min_action_purity=0.3,  # float: percentage purity above which is acceptable
-        prob=MDP_obj,  # str: 'max', or 'min' for maximization or minimization problem
-        gamma=0.9,  # discount factor
-        epsilon=10 ** (-10),
-        p=True,
-    ):
-        # if default value, then scale the min threshold with data size, ratio 0.008
-        if min_action_obs == -1:
-            min_action_obs = max(5, 0.008 * self.df_trained.shape[0])
-
-        # adding two clusters: one for sink node (reward = 0), one for punishment state
-        # sink node is R[s-2], punishment state is R[s-1]
-        R = self.R.copy()
-        P_df = self.P_df.copy()
-        P_df_1 = P_df.copy()
-        P_df["count"] = self.nc["count"]
-        P_df["purity"] = self.nc["purity"]
-        P_df = P_df.reset_index()
-
-        # record parameters of transition dataframe
-        a = P_df["ACTION"].nunique()  # number of actions
-        s = P_df[
-            "NEXT_CLUSTER"
-        ].nunique()  # already includes the sink node, number of clusters
-        actions = P_df["ACTION"].unique()
-
-        # Take note of rows where we have missing actions:
-        incomplete_clusters = np.where(P_df.groupby("CLUSTER")["ACTION"].count() < a)[0]
-        # stores tuples of clusters and missing action
-        missing_pairs = []
-        for c in incomplete_clusters:
-            not_present = np.setdiff1d(
-                actions, P_df.loc[P_df["CLUSTER"] == c]["ACTION"].unique()
-            )
-            for u in not_present:
-                missing_pairs.append((c, u))
-
-        # an additional punishment node (in addition to sink node) is added for actions we don't ever observe - we don't ever want to take these actions
-        P = np.zeros((a, s + 1, s + 1))
-        for index in P_df_1.index:
-            P[index[1], index[0], index[2]] = P_df_1.loc[
-                index
-            ]  # action, cluster, next_cluster
-
-        # basically doing the same thing as reinsert missing cluster-action pairs below
-        # quick bandaid fix for probabilities not summing to 1
-        for a in range(P.shape[0]):
-            for i in range(P.shape[1]):
-                if sum(P[a, i, :]) < 0.99:
-                    P[a, i, :] = 0
-                    P[a, i, -1] = (
-                        1  # for actions we don't know what happens next, send them to the punishment node
-                    )
-
-        punishment_node = s
-        sink_node = s - 1
-        # print('current R indices: ', R.index, 'new sink node: ', s-1, 'new punishment state: ', s)
-        if prob == "max":
-            R[punishment_node] = -np.inf
-        if prob == "min":
-            R[punishment_node] = (
-                np.inf
-            )  # s should be the name of the punishment node and have a reward of infinity
-
-        # reinsert transition for missing cluster-action pairs
-        for pair in missing_pairs:
-            c, u = pair
-            P[u, c, punishment_node] = 1
-        # is -1 the last state in the vector
-
-        # punishment node to 0 reward sink (if sink was created in get_MDP):
-        for u in range(a):
-            P[u, punishment_node, sink_node] = 1
-
-        self.P = P
-        self.R = R
-        # self.P_df = pd.DataFrame(P) #gives an error about 3d input
-        # solve the MDP, with an extra threshold to guarantee value iteration
-        # ends if gamma=1
-        v, pi, Vals = SolveMDP_Robust_expected(
-            P, R, gamma, epsilon, p, prob, threshold=self.t_max * self.r_max * 3
-        )  # threshold is only used when gamma=1?
-        # store values and policies and matrices
-        self.v = v
-        self.pi = pi
-
-        return v, pi, Vals
-
-    def solve_MDP_Robust(
-        self,
-        alpha=0.2,  # statistical alpha threshold
-        beta=0.6,  # statistical beta threshold
-        min_action_obs=-1,  # int: least number of actions that must be seen
-        min_action_purity=0.3,  # float: percentage purity above which is acceptable
-        prob=MDP_obj,  # str: 'max', or 'min' for maximization or minimization problem
-        gamma=0.9,  # discount factor
-        epsilon=10 ** (-10),
-        p=True,
-        prob_thresh=0,
-    ):
-        # if default value, then scale the min threshold with data size, ratio 0.008
-        if min_action_obs == -1:
-            min_action_obs = max(5, 0.008 * self.df_trained.shape[0])
-
-        # adding two clusters: one for sink node (reward = 0), one for punishment state
-        # sink node is R[s-1], punishment state is R[s]
-        R = self.R.copy()
-        P_df = self.P_df.copy()
-        P_df_1 = P_df.copy()
-        P_df["count"] = self.nc["count"]
-        P_df["purity"] = self.nc["purity"]
-        P_df = P_df.reset_index()
-
-        # record parameters of transition dataframe
-        a = P_df["ACTION"].nunique()  # number of actions
-        s = P_df[
-            "NEXT_CLUSTER"
-        ].nunique()  # already includes the sink node, number of clusters
-        actions = P_df["ACTION"].unique()
-
-        # Take note of rows where we have missing actions:
-        incomplete_clusters = np.where(P_df.groupby("CLUSTER")["ACTION"].count() < a)[0]
-        # stores tuples of clusters and missing action
-        missing_pairs = []
-        for c in incomplete_clusters:
-            not_present = np.setdiff1d(
-                actions, P_df.loc[P_df["CLUSTER"] == c]["ACTION"].unique()
-            )
-            for u in not_present:
-                missing_pairs.append((c, u))
-
-        # an additional punishment node (in addition to sink node) is added for actions we don't ever observe - we don't ever want to take these actions
-        P = np.zeros((a, s + 1, s + 1))
-        for index in P_df_1.index:
-            P[index[1], index[0], index[2]] = P_df_1.loc[
-                index
-            ]  # action, cluster, next_cluster
-
-        # basically doing the same thing as reinsert missing cluster-action pairs below
-        # quick bandaid fix for probabilities not summing to 1
-        for a in range(P.shape[0]):
-            for i in range(P.shape[1]):
-                if sum(P[a, i, :]) < 0.99:
-                    P[a, i, :] = 0
-                    P[a, i, -1] = (
-                        1  # for actions we don't know what happens next, send them to the punishment node
-                    )
-
-        # print('current R indices: ', R.index, 'new sink node: ', s-1, 'new punishment state: ', s)
-        if prob == "max":
-            R[s] = -np.inf
-        if prob == "min":
-            R[s] = (
-                np.inf
-            )  # s should be the name of the punishment node and have a reward of infinity
-
-        # reinsert transition for missing cluster-action pairs
-        for pair in missing_pairs:
-            c, u = pair
-            P[u, c, -1] = 1
-
-        # punishment node to 0 reward sink (if sink was created in get_MDP):
-        # if 'End' in self.df_trained['NEXT_CLUSTER'].unique():
-        for u in range(a):
-            P[u, -1, -2] = 1  # punishment node transitions to sink node?
-
-        self.P = P
-        # self.P_df = pd.DataFrame(P) #gives an error about 3d input
-        self.R = R
-
-        # solve the MDP, with an extra threshold to guarantee value iteration
-        # ends if gamma=1
-        v, pi, Vals = SolveMDP_Robust(
-            P,
-            R,
-            prob_thresh,
-            gamma,
-            epsilon,
-            p,
-            prob,
-            threshold=self.t_max * self.r_max * 3,
-        )  # threshold is only used when gamma=1?
-
-        # store values and policies and matrices
-        self.v = v
-        self.pi = pi
-
-        return v, pi, Vals
-
-    # the output dataframe has updated CLUSTER and NEXT_CLUSTER columns as well as predicted probabilities of ending up in each of the clusters next
-
     # initializing lists for error & accuracy data
     #     training_R2 = []
     #     testing_R2 = []
@@ -1658,15 +1458,9 @@ def splitter_stochastic(
             df["NEXT_CLUSTER"] = df.apply(
                 lambda x: replace_None_next_cluster(x), axis=1
             )
-            # df = df.replace('readmitted',2222)
-            # df = df.replace('discharged',1111)
-            # df = df.replace('dead',4444)
 
             le = preprocessing.LabelEncoder()
-            # all final clusters will be present in the cluster column, except cluster "9999" which is in place of unknown data (last observed data point)
-            # clusters = df['CLUSTER'].unique()
-            # clusters = np.append(clusters,[9999]) #we can't encode the next_cluster column without this line
-            # 9999 should be encoded to the highest consectuive number, not left as 9999
+            
             clusters = list(set(df["CLUSTER"]).union(set(df["NEXT_CLUSTER"])))
             le.fit(clusters)
             df["CLUSTER"] = le.transform(df["CLUSTER"])
@@ -1752,10 +1546,6 @@ def splitter_stochastic(
 
     # renumbering/encoding clusters nicely in df
     le = preprocessing.LabelEncoder()
-    # all final clusters will be present in the cluster column, except cluster "9999" which is in place of unknown data (last observed data point)
-    # clusters = df['CLUSTER'].unique()
-    # clusters = np.append(clusters,[9999]) #we can't encode the next_cluster column without this line
-    # 9999 should be encoded to the highest consectuive number, not left as 9999
     clusters = list(set(df["CLUSTER"]).union(set(df["NEXT_CLUSTER"])))
     le.fit(clusters)
     df["CLUSTER"] = le.transform(df["CLUSTER"])
@@ -1765,11 +1555,6 @@ def splitter_stochastic(
     if best_df != None:
         # renumbering/encoding clusters nicely in best_df
         le_best = preprocessing.LabelEncoder()
-        # all final clusters will be present in the cluster column, except cluster "9999" which is in place of unknown data (last observed data point)
-        # if this is not true, then append the list from "CLUSTER" and "NEXT_CLUSTER" together
-        # clusters = best_df['CLUSTER'].unique()
-        # clusters = np.append(clusters,[9999]) #we can't encode the next_cluster column without this line
-        # 9999 should be encoded to the highest consectuive number, not left as 9999
         clusters = list(set(best_df["CLUSTER"]).union(set(best_df["NEXT_CLUSTER"])))
         le_best.fit(clusters)
         best_df["CLUSTER"] = le_best.transform(best_df["CLUSTER"])
@@ -1783,50 +1568,10 @@ def splitter_stochastic(
     #     plotting functions
     #     ## Plotting accuracy and value R2
     its = np.arange(k + 1, nc + 1)
-    #     if plot:
-    #         if grid:
-    #             fig1, ax1 = plt.subplots()
-    #             #ax1.plot(its, training_R2, label= "Training R2")
-    #             ax1.plot(its, training_acc, label = "Training Accuracy")
-    #             if testing:
-    #                 ax1.plot(its, testing_acc, label = "Testing Accuracy")
-    #                 #ax1.plot(its, testing_R2, label = "Testing R2")
-    #             if n>0:
-    #                 ax1.axvline(x=n,linestyle='--',color='r') #Plotting vertical line at #cluster =n
-    #             ax1.set_ylim(0,1)
-    #             ax1.set_xlabel('# of Clusters')
-    #             ax1.set_ylabel('R2 or Accuracy %')
-    #             ax1.set_title('R2 and Accuracy During Splitting')
-    #             ax1.legend()
-    #         ## Plotting value error E((v_est - v_true)^2)
-    #         fig2, ax2 = plt.subplots()
-    #         norm_max = max(incoherences)
-    #         ax2.plot(its, training_error, label = "Training Error")
-    #         ax2.plot(its, np.array(incoherences)/norm_max, label = "Max Incoherence")
-    #         ax2.plot(its, np.array(thresholds)/norm_max, 'r-', label = "Threshold")
-    #         if testing:
-    #             ax2.plot(its, testing_error, label = "Testing Error")
-    #         if n>0:
-    #             ax2.axvline(x=n,linestyle='--',color='r') #Plotting vertical line at #cluster =n
-    #         ax2.set_ylim(0)
-    #         ax2.set_xlabel('# of Clusters')
-    #         ax2.set_ylabel('Value error')
-    #         ax2.set_title('Value error by number of clusters')
-    #         ax2.legend()
-    #         plt.show()
-    #
     df_train_error = pd.DataFrame(
         list(zip(its, training_error, prescriptive_error)),
         columns=["Clusters", "value prediction error", "average predicted value"],
     )
-    #     df_incoherences = pd.DataFrame(list(zip(its, incoherences)), \
-    #                                   columns = ['Clusters', 'Incoherences'])
-    #     if testing:
-    #         df_test_error = pd.DataFrame(list(zip(its, testing_error)), \
-    #                                   columns = ['Clusters', 'Error'])
-    #         return (df_new, df_incoherences, df_train_error,df_test_error, best_df, opt_k, split_scores)
-    # =============================================================================
-    # the output dataframe has updated CLUSTER and NEXT_CLUSTER columns as well as predicted probabilities of ending up in each of the clusters next
     return df, best_df, df_train_error, opt_k
 
 

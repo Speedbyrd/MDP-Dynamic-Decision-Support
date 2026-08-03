@@ -54,12 +54,12 @@ def simulate_single_patient_trajectory(
 @configure(profile=["DRIVER_MEMORY_EXTRA_EXTRA_LARGE", "EXECUTOR_MEMORY_LARGE"])
 @transform(
     simulated_trajectories_pi_E=Output(
-        "/TGH Research-fc396e/TGH Research - De Identified/logic/datasets/simulated_trajectories_train_piempiricalonworstP_71"
+        "/path/to/simulated_trajectories_pi_E"
     ),
-    df_trained=Input("ri.foundry.main.dataset.5119cfa1-690d-42f1-88fb-9e052b149a35"),
-    end_states=Input("ri.foundry.main.dataset.65e1a123-1f6e-4a34-985a-52c8beb94a83"),
-    P_df=Input("ri.foundry.main.dataset.a88fba25-572e-437f-a946-90045ab9381d"),
-    pi_E_df=Input("ri.foundry.main.dataset.4bebf270-b280-46ba-93d7-3a63524da020"),
+    df_trained=Input("/path/to/df_trained"),
+    end_states=Input("/path/to/end_states"),
+    P_df=Input("/path/to/P_df"),
+    pi_E_df=Input("/path/to/pi_E_df"),
 )
 
 def compute(df_trained, P_df, pi_E_df, end_states, simulated_trajectories_pi_E, ctx):
