@@ -1,7 +1,7 @@
 # MDP Dynamic Decision Support
 
 
-# train_clusters
+# train_clusters(features, end_states)
 
 Assigns clusters (clinical states) to the patient-hours.
 
@@ -45,16 +45,20 @@ P_df
 ```
 where prob is the probability of transitioning to NEXT_CLUSTER when taking action ACTION in CLUSTER. 
 
-# solve_MDP
+# solve_MDP(P_df, R_df)
 
-Takes in the outputs from clustering and solves for the optimal policy. 
+Takes in the outputs from train_clusters and solves for the optimal policy. 
 
 
 INPUTS
 
 R_df
 
+Output from train_clusters.
+
 P_df
+
+Output from train_clusters.
 
 
 
@@ -72,6 +76,45 @@ Q_E_df
 [...actions...]
 ```
 represents the action-value function (long-term risk) of the MDP. The value at row r and column c represents the value of action c when at cluster r. 
+
+# simulate_trajectories(df_trained_out, P_df, pi_E_df, end_states, max_steps, random_seed)
+
+Simulates trajectories for the set of patients in df_trained_out. Starts out at the first known state of each patient and always chooses the action according to the policy as described in pi_E_df, where after each action the next state of the patient is selected at random based on the transition probabilities in P_df. 
+
+
+INPUTS
+
+df_trained_out
+
+Output from train_clusters. 
+
+P_df
+
+The transition probability output from train_clusters
+
+pi_E_df
+
+The optimal policy output from solve_MDP
+
+
+max_steps
+
+The maximum number of time steps to simulate for. Defaults to 5000.
+
+random_seed
+
+A random seed determining the transitions that can be set for reproducable results. Defaults to 42
+
+
+OUTPUTS
+
+result_E
+
+```python
+['ID', 'TIME', 'CLUSTER', 'ACTION']
+```
+For each patient ID, the CLUSTER at TIME 0 is the (actual) first state they began in. Each subsequent CLUSTER is the simulated state transitioned to from the previous ACTION.
+
 
 # analyze_mrl_results.ipynb
 

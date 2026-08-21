@@ -1130,7 +1130,7 @@ def simulate_single_patient_trajectory(
     
     return trajectory
 
-def simulate_trajectories(df_trained, P_df, pi_E_df, end_states):
+def simulate_trajectories(df_trained, P_df, pi_E_df, end_states, max_steps = 5000, random_seed = 42):
     # Load as Spark DataFrames
     df_train_spark = df_trained.dataframe()
     P_spark = P_df.dataframe()
@@ -1202,8 +1202,8 @@ def simulate_trajectories(df_trained, P_df, pi_E_df, end_states):
             policy_dict_E,
             transition_dict,
             end_state_indices,
-            max_steps=5000,
-            random_seed=42
+            max_steps,
+            random_seed
         )
 
         trajectories.extend(trajectory)
