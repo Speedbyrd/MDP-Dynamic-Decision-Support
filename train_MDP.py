@@ -1,4 +1,3 @@
-from transforms.api import transform, Input, Output, configure
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark.ml.feature import VectorAssembler
@@ -7,159 +6,195 @@ from pyspark.ml.classification import RandomForestClassifier as SparkRF
 import math
 import logging
 from pyspark.sql.types import IntegerType
+import numpy as np
 
-logger = logging.getLogger(__name__)
+
 
 
 # ==========================
 # CLUSTERING
 # ==========================
 
-"""
-Fully Spark-native MDP Model Training — runs on ALL patients without OOM.
+def train_clusters(features, end_states):
+    # Config
+    max_k = 8
+    min_obs = 5000
+    min_splitoff = 300
 
-Performance-tuned version:
-- Checkpointing every 3 iterations to truncate Spark DAG lineage
-- Single NEXT_CLUSTER recompute per iteration (was 2)
-- Lighter RF (20 trees, depth 5) for faster iteration
-- Explicit unpersist of old caches
-- max_k=15 (clinically sufficient, avoids diminishing returns)
-"""
-@configure(profile=["DRIVER_MEMORY_EXTRA_EXTRA_LARGE", "EXECUTOR_MEMORY_LARGE"])
-@transform(
-    df_trained=Output("/path/to/df_trained"),
-    R_df=Output("/path/to/R_df"),
-    P_df=Output("/path/to/P_df"),
-    features=Input("/path/to/features"),
-    end_states=Input("/path/to/end_states"),
-)
-def compute(features, end_states, df_trained_out, R_df_out, P_df_out, ctx):
-    spark = ctx.spark_session
-
-    # ── Config ────────────────────────────────────────────────────────────
-    # pfeatures = 190
-    # n_clusters_init = 4
-    max_k = 8  # 15 clusters is clinically sufficient; avoids 28 slow iterations
-    min_obs = 5000  # smallest a cluster can be to still be considered for splitting
-    min_splitoff = 300 # the smallest number of points that can be split off into a new cluster
-    RF_NUM_TREES = 20  # Lighter RF per iteration (still effective for cluster assignment)
+    RF_NUM_TREES = 20
     RF_MAX_DEPTH = 5
-    CHECKPOINT_EVERY = 3  # Truncate Spark DAG lineage every N iterations
-    # ── 1. Load data (stays distributed) ──────────────────────────────────
-    
+    CHECKPOINT_EVERY = 3
+
+    # 1. Load data
     end_states_df = end_states.dataframe()
-    sdf = features.dataframe().where(F.col("ID").isNotNull()).where(F.col("TIME") >= 0)
-    sdf = sdf.withColumn("ID", F.col("ID").cast("string"))
-    sdf = sdf.withColumn("RISK", F.col("total_sofa") + F.col("RISK"))
+
+    sdf = (
+        features.dataframe()
+        .where(F.col("ID").isNotNull())
+        .where(F.col("TIME") >= 0)
+        .withColumn("ID", F.col("ID").cast("string"))
+        .withColumn("RISK", F.col("total_sofa") + F.col("RISK"))
+    )
 
     all_cols = sdf.columns
+
     feature_cols = [
         col
         for col in all_cols
-        if col not in ["ID", "TIME", "ACTION", "RISK", "CLUSTER", "NEXT_CLUSTER"]
+        if col not in [
+            "ID",
+            "TIME",
+            "ACTION",
+            "RISK",
+            "CLUSTER",
+            "NEXT_CLUSTER",
+        ]
     ]
 
-    # ── 2. Initial clustering by RISK (Spark KMeans) ──────────────────────
+    # 2. Initial clustering by RISK
     if "CLUSTER" not in all_cols:
         n_clusters_init = 3
+
         risk_asm = VectorAssembler(
-            inputCols=["RISK"], outputCol="risk_vec", handleInvalid="skip"
+            inputCols=["RISK"],
+            outputCol="risk_vec",
+            handleInvalid="skip",
         )
+
         sdf_risk = risk_asm.transform(sdf)
+
         km = SparkKMeans(
-            k=n_clusters_init, seed=0, featuresCol="risk_vec", predictionCol="CLUSTER"
+            k=n_clusters_init,
+            seed=0,
+            featuresCol="risk_vec",
+            predictionCol="CLUSTER",
         )
-        sdf = km.fit(sdf_risk).transform(sdf_risk).drop("risk_vec")
-        sdf = sdf.withColumn("CLUSTER", F.col("CLUSTER").cast("integer"))
+
+        sdf = (
+            km.fit(sdf_risk)
+            .transform(sdf_risk)
+            .drop("risk_vec")
+            .withColumn("CLUSTER", F.col("CLUSTER").cast("integer"))
+        )
+
     else:
-        logger.info("(Split) pre-initialized clusters")
-        n_clusters_init = sdf.select("CLUSTER").distinct().count()
+        print("(Split) pre-initialized clusters")
 
-    # Compute NEXT_CLUSTER
-    sdf = _recompute_next_cluster(sdf, end_states_df, spark)
-    sdf = sdf.localCheckpoint(eager=True)  # materialize + truncate lineage
-    # sdf = sdf.persist()
-    total_rows = sdf.count()
+        n_clusters_init = (
+            sdf
+            .select("CLUSTER")
+            .distinct()
+            .count()
+        )
+
+    sdf = _recompute_next_cluster(sdf, end_states_df)
+
+    sdf = sdf.localCheckpoint(eager=True)
+
     n_clusters = n_clusters_init
-    # logger.info(f"Rows: {total_rows:,} | Init clusters: {n_clusters_init} | Target: {max_k}")
+    prev_sdf = None
 
-    prev_sdf = None  # track for unpersist
-    # ── 3. Iterative splitting loop (all Spark, no toPandas) ──────────────
-    tried = []  # (c,a) pairs that we've already tried to split
+    # 3. Iterative splitting 
+    tried = []
+
     for iteration in range(max_k - n_clusters_init):
-        sdf_cluster_value_counts = sdf.groupBy("CLUSTER").count()
-        rows = sdf_cluster_value_counts.collect()
-        for row in rows:
-            logger.info(f"(Split) Cluster: {row['CLUSTER']}, Count: {row['count']}")
 
-        # Prepare features for RF training
-        rf_feature_cols = feature_cols + ["ACTION"]  # Include ACTION as a feature
+        # Log cluster sizes
+        cluster_counts = (
+            sdf
+            .groupBy("CLUSTER")
+            .count()
+            .collect()
+        )
+
+        for row in cluster_counts:
+            print(
+                f"(Split) Cluster: {row['CLUSTER']}, "
+                f"Count: {row['count']}"
+            )
+
+        # Random forest training data 
+        rf_feature_cols = feature_cols + ["ACTION"]
+
         rf_asm = VectorAssembler(
-            inputCols=rf_feature_cols, outputCol="rf_feat", handleInvalid="skip"
-        )
-        sdf_rf = rf_asm.transform(sdf)
-
-        # Prepare labels - use NEXT_CLUSTER as target
-        sdf_rf = sdf_rf.withColumn(
-            "NEXT_CLUSTER_label", F.col("NEXT_CLUSTER").cast("double")
+            inputCols=rf_feature_cols,
+            outputCol="rf_feat",
+            handleInvalid="skip",
         )
 
-        # Train Random Forest classifier
+        sdf_rf = (
+            rf_asm.transform(sdf)
+            .withColumn(
+                "NEXT_CLUSTER_label",
+                F.col("NEXT_CLUSTER").cast("double"),
+            )
+        )
+
+        # Random Forest
         rf = SparkRF(
             featuresCol="rf_feat",
             labelCol="NEXT_CLUSTER_label",
             numTrees=RF_NUM_TREES,
             maxDepth=RF_MAX_DEPTH,
             seed=0,
-            probabilityCol="rf_probabilities",  # Ensure probability output
+            probabilityCol="rf_probabilities",
         )
 
-        # Fit model only on rows with non-null NEXT_CLUSTER
-        rf_model = rf.fit(sdf_rf.where(F.col("NEXT_CLUSTER_label").isNotNull()))
+        rf_model = rf.fit(
+            sdf_rf.where(
+                F.col("NEXT_CLUSTER_label").isNotNull()
+            )
+        )
 
-        # Get predictions with probabilities
         preds = rf_model.transform(sdf_rf)
 
-        # Extract probability columns for each possible NEXT_CLUSTER value
-        # Get unique NEXT_CLUSTER values to create probability columns
+        # Find possible NEXT_CLUSTER values 
         unique_clusters = (
-            sdf.select("NEXT_CLUSTER")
+            sdf
+            .select("NEXT_CLUSTER")
             .where(F.col("NEXT_CLUSTER").isNotNull())
             .distinct()
-            .rdd.map(lambda row: row[0])
+            .rdd
+            .map(lambda row: row[0])
             .collect()
         )
-        unique_clusters = sorted([int(c) for c in unique_clusters if c is not None])
 
-        # logger.info(f"Creating probability columns for {len(unique_clusters)} clusters: {unique_clusters}")
+        unique_clusters = sorted(
+            int(c)
+            for c in unique_clusters
+            if c is not None
+        )
 
-        # Add probability columns for each cluster
-        from pyspark.ml.linalg import VectorUDT
-        from pyspark.sql.types import DoubleType
-
-        # Function to extract probability for specific cluster index
+        # Extract RF probability columns
         def extract_prob(cluster_idx):
+
             def _extract(prob_vector):
-                if prob_vector is not None and len(prob_vector) > cluster_idx:
+                if (
+                    prob_vector is not None
+                    and len(prob_vector) > cluster_idx
+                ):
                     return float(prob_vector[cluster_idx])
+
                 return 0.0
 
             return F.udf(_extract, DoubleType())
 
-        # Add probability columns for each unique cluster
         for i, cluster_id in enumerate(unique_clusters):
-            prob_col_name = f"prob_next_cluster_{cluster_id}"
-            preds = preds.withColumn(
-                prob_col_name, extract_prob(i)(F.col("rf_probabilities"))
+            prob_col_name = (
+                f"prob_next_cluster_{cluster_id}"
             )
 
-        # Update sdf with the probability columns
-        # prob_cols = [f"prob_next_cluster_{c}" for c in unique_clusters]
+            preds = preds.withColumn(
+                prob_col_name,
+                extract_prob(i)(
+                    F.col("rf_probabilities")
+                ),
+            )
+
         columns_to_keep = [
             col
             for col in preds.columns
-            if col
-            not in [
+            if col not in [
                 "rf_feat",
                 "NEXT_CLUSTER_label",
                 "rawPrediction",
@@ -167,26 +202,65 @@ def compute(features, end_states, df_trained_out, R_df_out, P_df_out, ctx):
                 "prediction",
             ]
         ]
-        prob_cols = [col for col in sdf.columns if col.startswith("prob_next_cluster_")]
+
         sdf = preds.select(columns_to_keep)
         sdf = sdf.localCheckpoint(eager=True)
 
-        # Evaluate incoherence
-        incoh = _compute_information_radius(sdf, min_obs)
+        # Important:
+        # In your original code this was based on the OLD sdf columns,
+        # which means it could accidentally be empty.
+        prob_cols = [
+            col
+            for col in sdf.columns
+            if col.startswith("prob_next_cluster_")
+        ]
+
+        # Evaluate incoherence 
+        incoh = _compute_information_radius(
+            sdf,
+            min_obs,
+        )
+
         split_success = False
-        # tried = []
+
         for row in incoh.collect():
-            if (row["CLUSTER"], row["ACTION"]) not in tried and row["cnt"] >= min_obs:
-                logger.info(
-                    f"Split try cluster: {row['CLUSTER']}, action: {row['ACTION']}, incoherence={row['incoherence']}, n={row['cnt']}"
+
+            cluster_action = (
+                row["CLUSTER"],
+                row["ACTION"],
+            )
+
+            if (
+                cluster_action not in tried
+                and row["cnt"] >= min_obs
+            ):
+                print(
+                    f"Split try cluster: {row['CLUSTER']}, "
+                    f"action: {row['ACTION']}, "
+                    f"incoherence={row['incoherence']}, "
+                    f"n={row['cnt']}"
                 )
-                tried.append((row["CLUSTER"], row["ACTION"]))
-                all_worst_cluster_split = split_worst_cluster_with_rf_and_kmeans(
-                    sdf, row, prob_cols, logger
+
+                tried.append(cluster_action)
+
+                all_worst_cluster_split = (
+                    split_worst_cluster_with_rf_and_kmeans(
+                        sdf,
+                        row,
+                        prob_cols,
+                    )
                 )
+
+                # Candidate subcluster 1
                 subcluster1 = (
-                    all_worst_cluster_split.where(F.col("final_sub_cluster") == 1)
-                    .withColumn("CLUSTER", F.col("final_sub_cluster"))
+                    all_worst_cluster_split
+                    .where(
+                        F.col("final_sub_cluster") == 1
+                    )
+                    .withColumn(
+                        "CLUSTER",
+                        F.col("final_sub_cluster"),
+                    )
                     .drop(
                         "transition_vec",
                         "rf_features",
@@ -196,11 +270,19 @@ def compute(features, end_states, df_trained_out, R_df_out, P_df_out, ctx):
                         "final_sub_cluster",
                     )
                 )
+
                 subcluster1_size = subcluster1.count()
-                # worst_incoherence1 = _compute_information_radius(subcluster1, min_obs).collect()[0]['incoherence']
+
+                # Candidate subcluster 0
                 subcluster0 = (
-                    all_worst_cluster_split.where(F.col("final_sub_cluster") == 0)
-                    .withColumn("CLUSTER", F.col("final_sub_cluster"))
+                    all_worst_cluster_split
+                    .where(
+                        F.col("final_sub_cluster") == 0
+                    )
+                    .withColumn(
+                        "CLUSTER",
+                        F.col("final_sub_cluster"),
+                    )
                     .drop(
                         "transition_vec",
                         "rf_features",
@@ -210,199 +292,377 @@ def compute(features, end_states, df_trained_out, R_df_out, P_df_out, ctx):
                         "final_sub_cluster",
                     )
                 )
+
                 subcluster0_size = subcluster0.count()
-                # worst_incoherence0 = _compute_information_radius(subcluster0, min_obs).collect()[0]['incoherence']
-                if subcluster0_size >= min_splitoff and subcluster1_size >= min_splitoff:
-                    worst_incoherence0 = _compute_information_radius(
-                        subcluster0, min_splitoff
-                    ).collect()[0]["incoherence"]
-                    worst_incoherence1 = _compute_information_radius(
-                        subcluster1, min_splitoff
-                    ).collect()[0]["incoherence"]
-                    logger.info(
-                        f"(Split) subcluster 0 incoherence: {worst_incoherence0}, size: {subcluster0_size}"
+
+                # Check whether split is large enough
+                if (
+                    subcluster0_size >= min_splitoff
+                    and subcluster1_size >= min_splitoff
+                ):
+                    worst_incoherence0 = (
+                        _compute_information_radius(
+                            subcluster0,
+                            min_splitoff,
+                        )
+                        .collect()[0]["incoherence"]
                     )
-                    logger.info(
-                        f"(Split) subcluster 1 incoherence: {worst_incoherence1}, size: {subcluster1_size}"
+
+                    worst_incoherence1 = (
+                        _compute_information_radius(
+                            subcluster1,
+                            min_splitoff,
+                        )
+                        .collect()[0]["incoherence"]
                     )
-                    # if (
-                    #     worst_incoherence0 < 2 * row["incoherence"]
-                    #     and worst_incoherence1 < 2 * row["incoherence"]
-                    # ):
+
+                    print(
+                        "(Split) subcluster 0 "
+                        f"incoherence: {worst_incoherence0}, "
+                        f"size: {subcluster0_size}"
+                    )
+
+                    print(
+                        "(Split) subcluster 1 "
+                        f"incoherence: {worst_incoherence1}, "
+                        f"size: {subcluster1_size}"
+                    )
+
                     split_success = True
                     split_row = row
                     split_cluster = row["CLUSTER"]
-                    break
-                else:
-                    logger.info(f"(Split) subcluster 0 size: {subcluster0_size}")
-                    logger.info(f"(Split) subcluster 1 size: {subcluster1_size}")
 
-        if split_success == True:
-            # Apply cluster renumbering based on final sub-cluster assignments
+                    break
+
+                else:
+                    print(
+                        "(Split) subcluster 0 "
+                        f"size: {subcluster0_size}"
+                    )
+                    print(
+                        "(Split) subcluster 1 "
+                        f"size: {subcluster1_size}"
+                    )
+
+        # Apply successful split
+        if split_success:
+
             new_cluster_number = n_clusters
-            subset_new = all_worst_cluster_split.withColumn(
-                "CLUSTER",
-                F.when(F.col("final_sub_cluster") == 0, F.col("CLUSTER")).otherwise(
-                    F.lit(new_cluster_number).cast("integer")
-                ),
-            ).drop(
-                "transition_vec",
-                "rf_features",
-                "kmeans_label",
-                "rf_prediction",
-                "rf_label",
-                "final_sub_cluster",
+
+            subset_new = (
+                all_worst_cluster_split
+                .withColumn(
+                    "CLUSTER",
+                    F.when(
+                        F.col("final_sub_cluster") == 0,
+                        F.col("CLUSTER"),
+                    ).otherwise(
+                        F.lit(
+                            new_cluster_number
+                        ).cast("integer")
+                    ),
+                )
+                .drop(
+                    "transition_vec",
+                    "rf_features",
+                    "kmeans_label",
+                    "rf_prediction",
+                    "rf_label",
+                    "final_sub_cluster",
+                )
             )
-            # Get data points not in the worst cluster (unchanged)
-            rest = sdf.where(F.col("CLUSTER") != int(split_row["CLUSTER"]))
-            logger.info(
-                f"Split COMPLETE: {subset_new.where(F.col('CLUSTER') == new_cluster_number).count()} points moved to new cluster {new_cluster_number} from cluster {split_cluster}"
+
+            rest = sdf.where(
+                F.col("CLUSTER")
+                != int(split_row["CLUSTER"])
             )
-            # Track old for unpersist
+
+            print(
+                "Split COMPLETE: "
+                f"{subset_new.where(F.col('CLUSTER') == new_cluster_number).count()} "
+                f"points moved to new cluster "
+                f"{new_cluster_number} "
+                f"from cluster {split_cluster}"
+            )
+
             prev_sdf = sdf
-            # Union and recompute NEXT_CLUSTER (single recompute per iteration)
+
             sdf = rest.unionByName(
-                subset_new, allowMissingColumns=True
-            )  # what is unionByName
-            sdf = _recompute_next_cluster(sdf, end_states_df, spark)
-            n_clusters = n_clusters + 1
-            # calculating the new MDP and predictive metrics
-            max_cluster = sdf.agg(F.max("CLUSTER")).collect()[0][0]
+                subset_new,
+                allowMissingColumns=True,
+            )
+
+            sdf = _recompute_next_cluster(
+                sdf,
+                end_states_df,
+            )
+
+            n_clusters += 1
+
+            # Evaluate resulting MDP
+            max_cluster = (
+                sdf
+                .agg(F.max("CLUSTER"))
+                .collect()[0][0]
+            )
+
             offset = max_cluster + 1
-            # Get unique end states
-            unique_end_states = [
-                row["end_state"]
-                for row in end_states_df.select("end_state").distinct().collect()
-            ]
-            # Map each end state to an integer starting from offset
-            end_state_mapping = {
-                state: idx + offset for idx, state in enumerate(unique_end_states)
-            }
-            # Create a mapping DataFrame
-            mapping_df = spark.createDataFrame(
-                [(state, idx) for state, idx in end_state_mapping.items()],
-                ["end_state", "end_state_indexed"],
+
+            # Build indexed end states
+            end_state_window = Window.orderBy(
+                F.col("end_state")
             )
-            # join mapping to end state df
-            end_states_indexed = end_states_df.join(
-                mapping_df, on="end_state", how="left"
+
+            end_states_indexed = (
+                end_states_df
+                .withColumn(
+                    "end_state_indexed",
+                    (
+                        F.dense_rank()
+                        .over(end_state_window)
+                        - 1
+                        + F.lit(offset)
+                    ).cast("integer"),
+                )
             )
-            # ── 5. Compute P and R matrices (tiny aggregations) ───────────────────
-            # logger.info("Computing transition probabilities (P) and rewards (R)...")
+
+            # Transition matrix P
             P_sdf = (
-                sdf.where(F.col("NEXT_CLUSTER").isNotNull())
-                .groupBy("CLUSTER", "ACTION", "NEXT_CLUSTER")
-                .agg(F.count("*").alias("cnt"))
+                sdf
+                .where(
+                    F.col("NEXT_CLUSTER").isNotNull()
+                )
+                .groupBy(
+                    "CLUSTER",
+                    "ACTION",
+                    "NEXT_CLUSTER",
+                )
+                .agg(
+                    F.count("*").alias("cnt")
+                )
             )
-            totals = P_sdf.groupBy("CLUSTER", "ACTION").agg(F.sum("cnt").alias("total"))
+
+            totals = (
+                P_sdf
+                .groupBy("CLUSTER", "ACTION")
+                .agg(
+                    F.sum("cnt").alias("total")
+                )
+            )
+
             P_sdf = (
-                P_sdf.join(totals, on=["CLUSTER", "ACTION"])
-                .withColumn("prob", F.col("cnt") / F.col("total"))
-                .select("CLUSTER", "ACTION", "NEXT_CLUSTER", "prob")
+                P_sdf
+                .join(
+                    totals,
+                    on=["CLUSTER", "ACTION"],
+                )
+                .withColumn(
+                    "prob",
+                    F.col("cnt") / F.col("total"),
+                )
+                .select(
+                    "CLUSTER",
+                    "ACTION",
+                    "NEXT_CLUSTER",
+                    "prob",
+                )
             )
-            # Existing R_sdf for regular clusters (remove cnt column)
+
+            # Reward matrix R
             R_sdf = (
-                sdf.groupBy("CLUSTER")
-                .agg(F.mean("RISK").alias("RISK"))
-                .select("CLUSTER", "RISK")
+                sdf
+                .groupBy("CLUSTER")
+                .agg(
+                    F.mean("RISK").alias("RISK")
+                )
+                .select(
+                    "CLUSTER",
+                    "RISK",
+                )
             )
-            # Prepare end states as additional clusters (one row per end state, no cnt)
-            end_states_clusters = end_states_indexed.select(
-                F.col("end_state_indexed").alias("CLUSTER"),
-                F.col("Reward").alias("RISK"),
-            ).distinct()  # Ensures one row per end state
-            # Union the two DataFrames (CLUSTER, RISK only)
-            R_sdf = R_sdf.unionByName(end_states_clusters, allowMissingColumns=True)
-            # accuracy, confusion_df = compute_most_likely_final_end_state(
-            #     sdf, P_sdf, end_states_indexed, logger
-            # )
-            mae, mse, R2 = one_step_reward_error(sdf, P_sdf, R_sdf, end_states_indexed)
-            logger.info(
-                f"MDP one step reward prediction error after Split: MAE={mae:.4f}, MSE={mse:.4f}, R2={R2:.4f}"
+
+            end_states_clusters = (
+                end_states_indexed
+                .select(
+                    F.col(
+                        "end_state_indexed"
+                    ).alias("CLUSTER"),
+                    F.col("Reward").alias("RISK"),
+                )
+                .distinct()
             )
+
+            R_sdf = R_sdf.unionByName(
+                end_states_clusters,
+                allowMissingColumns=True,
+            )
+
+            mae, mse, R2 = one_step_reward_error(
+                sdf,
+                P_sdf,
+                R_sdf,
+                end_states_indexed,
+            )
+
+            print(
+                "MDP one step reward prediction "
+                "error after Split: "
+                f"MAE={mae:.4f}, "
+                f"MSE={mse:.4f}, "
+                f"R2={R2:.4f}"
+            )
+
         else:
-            logger.info("Split failed")
+            print("Split failed")
             break
 
-        # Checkpoint every N iterations to truncate lineage
-        if (iteration + 1) % CHECKPOINT_EVERY == 0:
-            # logger.info(f"Checkpointing (lineage truncation)...")
-            sdf = sdf.localCheckpoint(eager=True)
+        # Lineage management
+        if (
+            iteration + 1
+        ) % CHECKPOINT_EVERY == 0:
+
+            sdf = sdf.localCheckpoint(
+                eager=True
+            )
+
         else:
             sdf = sdf.cache()
-            sdf.count()  # materialize
+            sdf.count()
 
-        # Unpersist old DataFrame
         if prev_sdf is not None:
             try:
                 prev_sdf.unpersist()
             except Exception:
                 pass
 
-        # logger.info(f"(Split) end of iteration number of clusters: {n_clusters + 1}")
-
+    # 4. Finalize 
     sdf = sdf.localCheckpoint(eager=True)
-    max_cluster = sdf.agg(F.max("CLUSTER")).collect()[0][0]
+
+    max_cluster = (
+        sdf
+        .agg(F.max("CLUSTER"))
+        .collect()[0][0]
+    )
+
     offset = max_cluster + 1
-    # Get unique end states
-    unique_end_states = [
-        row["end_state"]
-        for row in end_states_df.select("end_state").distinct().collect()
-    ]
-    # Map each end state to an integer starting from offset
-    end_state_mapping = {
-        state: idx + offset for idx, state in enumerate(unique_end_states)
-    }
-    # Create a mapping DataFrame
-    mapping_df = spark.createDataFrame(
-        [(state, idx) for state, idx in end_state_mapping.items()],
-        ["end_state", "end_state_indexed"],
-    )
-    # join mapping to end state df
-    end_states_indexed = end_states_df.join(mapping_df, on="end_state", how="left")
 
-    # ── 5. Compute P and R matrices (tiny aggregations) ───────────────────
-    # logger.info("Computing transition probabilities (P) and rewards (R)...")
-    P_sdf = (
-        sdf.where(F.col("NEXT_CLUSTER").isNotNull())
-        .groupBy("CLUSTER", "ACTION", "NEXT_CLUSTER")
-        .agg(F.count("*").alias("cnt"))
+    # Index end states without createDataFrame()
+    end_state_window = Window.orderBy(
+        F.col("end_state")
     )
-    totals = P_sdf.groupBy("CLUSTER", "ACTION").agg(F.sum("cnt").alias("total"))
-    P_sdf = (
-        P_sdf.join(totals, on=["CLUSTER", "ACTION"])
-        .withColumn("prob", F.col("cnt") / F.col("total"))
-        .select("CLUSTER", "ACTION", "NEXT_CLUSTER", "prob")
+
+    end_states_indexed = (
+        end_states_df
+        .withColumn(
+            "end_state_indexed",
+            (
+                F.dense_rank()
+                .over(end_state_window)
+                - 1
+                + F.lit(offset)
+            ).cast("integer"),
+        )
     )
-    # Existing R_sdf for regular clusters (remove cnt column)
+
+    # 5. Final P matrix 
+    P_sdf = (
+        sdf
+        .where(
+            F.col("NEXT_CLUSTER").isNotNull()
+        )
+        .groupBy(
+            "CLUSTER",
+            "ACTION",
+            "NEXT_CLUSTER",
+        )
+        .agg(
+            F.count("*").alias("cnt")
+        )
+    )
+
+    totals = (
+        P_sdf
+        .groupBy("CLUSTER", "ACTION")
+        .agg(
+            F.sum("cnt").alias("total")
+        )
+    )
+
+    P_sdf = (
+        P_sdf
+        .join(
+            totals,
+            on=["CLUSTER", "ACTION"],
+        )
+        .withColumn(
+            "prob",
+            F.col("cnt") / F.col("total"),
+        )
+        .select(
+            "CLUSTER",
+            "ACTION",
+            "NEXT_CLUSTER",
+            "prob",
+        )
+    )
+
+    # 6. Final R matrix 
     R_sdf = (
-        sdf.groupBy("CLUSTER")
-        .agg(F.mean("RISK").alias("RISK"))
-        .select("CLUSTER", "RISK")
+        sdf
+        .groupBy("CLUSTER")
+        .agg(
+            F.mean("RISK").alias("RISK")
+        )
+        .select(
+            "CLUSTER",
+            "RISK",
+        )
     )
 
-    # Prepare end states as additional clusters (one row per end state, no cnt)
-    end_states_clusters = end_states_indexed.select(
-        F.col("end_state_indexed").alias("CLUSTER"), F.col("Reward").alias("RISK")
-    ).distinct()  # Ensures one row per end state
+    end_states_clusters = (
+        end_states_indexed
+        .select(
+            F.col(
+                "end_state_indexed"
+            ).alias("CLUSTER"),
+            F.col("Reward").alias("RISK"),
+        )
+        .distinct()
+    )
 
-    # Union the two DataFrames (CLUSTER, RISK only)
-    R_sdf = R_sdf.unionByName(end_states_clusters, allowMissingColumns=True)
+    R_sdf = R_sdf.unionByName(
+        end_states_clusters,
+        allowMissingColumns=True,
+    )
 
-    P_pdf = P_sdf.toPandas()
-    R_pdf = R_sdf.toPandas()
-    # logger.info(f"P matrix: {len(P_pdf)} entries | R matrix: {len(R_pdf)} clusters")
-
-    # ── 6. Write outputs ──────────────────────────────────────────────────
+    # 7. Return pandas DataFrames 
     output_cols = (
-        ["ID", "TIME"] + feature_cols + ["ACTION", "RISK", "CLUSTER", "NEXT_CLUSTER"]
+        ["ID", "TIME"]
+        + feature_cols
+        + [
+            "ACTION",
+            "RISK",
+            "CLUSTER",
+            "NEXT_CLUSTER",
+        ]
     )
-    existing = [c for c in output_cols if c in sdf.columns]
-    df_trained_out.write_dataframe(sdf.select(existing))
-    R_df_out.write_dataframe(_pandas_to_spark_safe(spark, R_pdf))
-    P_df_out.write_dataframe(_pandas_to_spark_safe(spark, P_pdf))
 
-    # logger.info("All outputs written successfully.")
+    existing = [
+        c
+        for c in output_cols
+        if c in sdf.columns
+    ]
+
+    df_trained_pd = (
+        sdf
+        .select(existing)
+        .toPandas()
+    )
+
+    P_pd = P_sdf.toPandas()
+    R_pd = R_sdf.toPandas()
+
+    return df_trained_pd, P_pd, R_pd
 
 def one_step_reward_error(df_trained, P_sdf, R_sdf, end_state_rewards_df):
     # Join transition matrix with reward table to get expected next risk
@@ -453,7 +713,7 @@ def one_step_reward_error(df_trained, P_sdf, R_sdf, end_state_rewards_df):
     return mae, mse, R2
 
 
-def compute_most_likely_final_end_state(sdf, P_sdf, end_states_indexed, logger=None):
+def compute_most_likely_final_end_state(sdf, P_sdf, end_states_indexed):
     """
     For each patient, simulate the MDP using actual actions and always transition to the most likely next cluster.
     Returns accuracy and confusion matrix comparing predicted vs true end state.
@@ -536,56 +796,84 @@ def compute_most_likely_final_end_state(sdf, P_sdf, end_states_indexed, logger=N
         .orderBy("predicted_final_cluster", "end_state_indexed")
     )
 
-    if logger:
-        logger.info(
-            f"(Split) MDP most likely end state prediction accuracy: {accuracy:.4f}"
+    print(f"(Split) MDP most likely end state prediction accuracy: {accuracy:.4f}")
+    print(f"(Split) MDP most likely end state confusion matrix:")
+    for row in confusion_df.collect():
+        print(
+            f"(Split) Predicted: {row['predicted_final_cluster']}, True: {row['end_state_indexed']}, Count: {row['count']}"
         )
-        logger.info("(Split) MDP most likely end state confusion matrix:")
-        for row in confusion_df.collect():
-            logger.info(
-                f"(Split) Predicted: {row['predicted_final_cluster']}, True: {row['end_state_indexed']}, Count: {row['count']}"
-            )
 
     return accuracy, confusion_df
 
 
-def _recompute_next_cluster(sdf, end_states, spark):
-    # number the clusters
-    """Compute NEXT_CLUSTER using window lead, filling last timestep with ID-specific end state."""
-    max_cluster = sdf.agg(F.max("CLUSTER")).collect()[0][0]
+def _recompute_next_cluster(sdf, end_states):
+    """
+    Compute NEXT_CLUSTER using window lead,
+    filling each patient's final timestep with their indexed end state.
+    """
+
+    # Find where end-state cluster numbering should begin
+    max_cluster = sdf.agg(
+        F.max("CLUSTER")
+    ).collect()[0][0]
+
     offset = max_cluster + 1
-    # Get unique end states
-    unique_end_states = [
-        row["end_state"] for row in end_states.select("end_state").distinct().collect()
-    ]
-    # Map each end state to an integer starting from offset
-    end_state_mapping = {
-        state: idx + offset for idx, state in enumerate(unique_end_states)
-    }
-    # Create a mapping DataFrame
-    mapping_df = spark.createDataFrame(
-        [(state, idx) for state, idx in end_state_mapping.items()],
-        ["end_state", "end_state_indexed"],
-    )
-    # join mapping to end state df
-    end_states_indexed = end_states.join(mapping_df, on="end_state", how="left")
 
+    # Assign each unique end_state an integer:
+    #
+    # offset, offset + 1, offset + 2, ...
+    end_state_window = Window.orderBy("end_state")
+
+    end_states_indexed = (
+        end_states
+        .withColumn(
+            "end_state_indexed",
+            (
+                F.dense_rank().over(end_state_window)
+                - 1
+                + F.lit(offset)
+            ).cast("integer")
+        )
+    )
+
+    # Window over each patient's trajectory
     w = Window.partitionBy("ID").orderBy("TIME")
-    sdf = sdf.drop("NEXT_CLUSTER") if "NEXT_CLUSTER" in sdf.columns else sdf
-    # adding end state column
-    sdf_with_end_state = sdf.join(
-        end_states_indexed.select("ID", F.col("end_state_indexed").alias("END_STATE")),
-        on="ID",
-        how="left",
+
+    # Remove old NEXT_CLUSTER if we're recomputing it
+    if "NEXT_CLUSTER" in sdf.columns:
+        sdf = sdf.drop("NEXT_CLUSTER")
+
+    # Attach each patient's terminal state
+    sdf_with_end_state = (
+        sdf
+        .join(
+            end_states_indexed.select(
+                "ID",
+                F.col("end_state_indexed").alias("END_STATE")
+            ),
+            on="ID",
+            how="left"
+        )
     )
 
-    return sdf_with_end_state.withColumn(
-        "NEXT_CLUSTER", F.coalesce(F.lead("CLUSTER").over(w), F.col("END_STATE"))
-    ).drop("END_STATE")
+    # NEXT_CLUSTER =
+    #   next timestep's CLUSTER, if one exists
+    #   otherwise patient's terminal/end state
+    return (
+        sdf_with_end_state
+        .withColumn(
+            "NEXT_CLUSTER",
+            F.coalesce(
+                F.lead("CLUSTER").over(w),
+                F.col("END_STATE")
+            )
+        )
+        .drop("END_STATE")
+    )
 
 
 def _compute_incoherence(sdf, min_obs=500):
-    logger.info("(Split) deterministic count incoherence metric")
+    print("(Split) deterministic count incoherence metric")
     """Incoherence per (cluster, action) = stddev of NEXT_CLUSTER within group."""
     return (
         sdf.where(F.col("NEXT_CLUSTER").isNotNull())
@@ -600,7 +888,7 @@ def _compute_incoherence(sdf, min_obs=500):
 
 
 def _compute_information_radius(sdf, min_obs=1000):
-    logger.info("(Split) JSD incoherence metric")
+    print("(Split) JSD incoherence metric")
     prob_cols = [col for col in sdf.columns if col.startswith("prob_next_cluster_")]
     grouped = (
         sdf.where(F.col("NEXT_CLUSTER").isNotNull())
@@ -652,19 +940,7 @@ def _compute_information_radius(sdf, min_obs=1000):
     )
 
 
-def _pandas_to_spark_safe(spark, pdf, chunk_size=50000):
-    """Convert pandas DataFrame to Spark in chunks to avoid serialization limit."""
-    if pdf.empty:
-        return spark.createDataFrame(pdf)
-    chunks = [pdf.iloc[i : i + chunk_size] for i in range(0, len(pdf), chunk_size)]
-    sdfs = [spark.createDataFrame(chunk) for chunk in chunks]
-    result = sdfs[0]
-    for sdf in sdfs[1:]:
-        result = result.unionByName(sdf, allowMissingColumns=True)
-    return result
-
-
-def split_worst_cluster_with_rf_and_kmeans(sdf, worst, prob_cols, logger=None):
+def split_worst_cluster_with_rf_and_kmeans(sdf, worst, prob_cols):
     """
     Splits the worst cluster/action using K-means and classifies remaining points with Random Forest.
 
@@ -672,7 +948,6 @@ def split_worst_cluster_with_rf_and_kmeans(sdf, worst, prob_cols, logger=None):
         sdf (DataFrame): Input Spark DataFrame.
         worst (dict): Dict with keys 'CLUSTER' and 'ACTION' indicating the worst cluster/action.
         prob_cols (list): List of column names for transition probabilities.
-        logger (optional): Logger object for info/debug output.
 
     Returns:
         DataFrame: DataFrame with 'final_sub_cluster' column, combining K-means and RF results.
@@ -755,10 +1030,6 @@ def split_worst_cluster_with_rf_and_kmeans(sdf, worst, prob_cols, logger=None):
         all_worst_cluster_split = kmeans_final.select(common_cols).unionByName(
             rf_final.select(common_cols), allowMissingColumns=True
         )
-        # if logger:
-        #     logger.info(
-        #         f"(Split) RF classified {remaining_classified.count()} additional points using all features"
-        #     )
     else:
         # Only K-means results if no other actions in worst cluster
         all_worst_cluster_split = kmeans_labeled.withColumn(
@@ -777,28 +1048,7 @@ from .MDPTools import (
     SolveMDP,
 )
 
-@configure(profile=["DRIVER_MEMORY_EXTRA_EXTRA_LARGE", "EXECUTOR_MEMORY_MEDIUM"])
-@transform(
-    R_df=Input(
-        "/path/to/R_df"
-    ),
-    P_df=Input(
-        "/path/to/P_df"
-    ),
-    pi_E_df=Output(
-        "/path/to/pi_E_df"
-    ),
-    Q_E_df=Output(
-        "/path/to/Q_E_df"
-    ),
-)
-def compute(
-    P_df,
-    R_df,
-    pi_E_df,
-    Q_E_df,
-    ctx,
-):
+def solve_MDP(P_df, R_df):
     # solving the MDP
     P_df = P_df.dataframe().toPandas()
     print("P_df: ", P_df)
@@ -828,8 +1078,140 @@ def compute(
         threshold=float("inf"),
     )
 
-    pi_E = pd.DataFrame(pi_E).reset_index().rename(columns={"index": "CLUSTER", "0": "ACTION"})
-    pi_E_df.write_dataframe(ctx.spark_session.createDataFrame(pi_E))
-    Q_E_df.write_dataframe(ctx.spark_session.createDataFrame(pd.DataFrame(Q_E)))
+    pi_E_df = pd.DataFrame(pi_E).reset_index().rename(columns={"index": "CLUSTER", "0": "ACTION"})
+    Q_E_df = pd.DataFrame(Q_E)
+    return pi_E_df, Q_E_df
 
+
+def simulate_single_patient_trajectory(
+    patient_id,
+    starting_cluster,
+    policy_dict,
+    transition_dict,
+    end_state_indices,
+    max_steps=5000,
+    random_seed=42
+):
+    """Simulate trajectory for a single patient - returns list of records."""
+    if random_seed is not None:
+        np.random.seed(random_seed + hash(patient_id) % 10000)
     
+    trajectory = []
+    current_cluster = int(starting_cluster)
+    time_step = 0
+    
+    while time_step < max_steps and current_cluster not in end_state_indices:
+        if current_cluster not in policy_dict:
+            break
+        action = int(policy_dict[current_cluster])
+        print("cluster: ", current_cluster, "action: ", action)
+        trajectory.append({
+            "ID": patient_id,
+            "TIME": time_step,
+            "CLUSTER": current_cluster,
+            "ACTION": action,
+        })
+        
+        key = (current_cluster, action)
+        if key not in transition_dict:
+            break
+            
+        next_clusters, probs = transition_dict[key]
+        current_cluster = int(np.random.choice(next_clusters, p=probs))
+        time_step += 1
+    
+    # Add final state
+    trajectory.append({
+        "ID": patient_id,
+        "TIME": time_step,
+        "CLUSTER": current_cluster,
+        "ACTION": None,
+    })
+    
+    return trajectory
+
+def simulate_trajectories(df_trained, P_df, pi_E_df, end_states):
+    # Load as Spark DataFrames
+    df_train_spark = df_trained.dataframe()
+    P_spark = P_df.dataframe()
+    pi_E_spark = pi_E_df.dataframe()
+    end_state_df = end_states.dataframe()
+
+    # Policy dictionary
+    pi_E_pandas = (
+        pi_E_spark
+        .withColumnRenamed("0", "ACTION")
+        .toPandas()
+    )
+
+    policy_dict_E = (
+        pi_E_pandas
+        .set_index("CLUSTER")["ACTION"]
+        .to_dict()
+    )
+
+    # Transition dictionary
+    P_pandas = P_spark.toPandas()
+
+    transition_dict = {}
+
+    for (cluster, action), group in P_pandas.groupby(["CLUSTER", "ACTION"]):
+        next_clusters = group["NEXT_CLUSTER"].values
+        probs = group["prob"].values
+
+        probs = probs / probs.sum()
+
+        transition_dict[(int(cluster), int(action))] = (
+            next_clusters,
+            probs
+        )
+
+    # End states
+    max_real_cluster = (
+        df_train_spark
+        .agg(F.max("CLUSTER"))
+        .collect()[0][0]
+    )
+
+    num_end_states = end_state_df.count()
+
+    end_state_indices = list(
+        range(
+            max_real_cluster + 1,
+            max_real_cluster + 1 + num_end_states
+        )
+    )
+
+    # Starting states
+    starting_states = (
+        df_train_spark
+        .filter(F.col("TIME") == 0)
+        .select("ID", "CLUSTER")
+    )
+
+    # Collect only starting states to driver
+    starting_states_pd = starting_states.toPandas()
+
+    # Simulate trajectories
+    trajectories = []
+
+    for row in starting_states_pd.itertuples(index=False):
+        trajectory = simulate_single_patient_trajectory(
+            row.ID,
+            row.CLUSTER,
+            policy_dict_E,
+            transition_dict,
+            end_state_indices,
+            max_steps=5000,
+            random_seed=42
+        )
+
+        trajectories.extend(trajectory)
+
+    # Return final pandas DataFrame
+    result_E = pd.DataFrame(
+        trajectories,
+        columns=["ID", "TIME", "CLUSTER", "ACTION"]
+    )
+
+    return result_E

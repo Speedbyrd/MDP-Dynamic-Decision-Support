@@ -1,7 +1,7 @@
 # MDP Dynamic Decision Support
 
 
-# CLUSTERING
+# train_clusters
 
 Assigns clusters (clinical states) to the patient-hours.
 
@@ -45,7 +45,7 @@ P_df
 ```
 where prob is the probability of transitioning to NEXT_CLUSTER when taking action ACTION in CLUSTER. 
 
-# SOLVING the MDP
+# solve_MDP
 
 Takes in the outputs from clustering and solves for the optimal policy. 
 
